@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 export default function Home() {
@@ -71,6 +72,9 @@ export default function Home() {
           <p className="text-zinc-400 mt-1">
             Analyze your prop firm survival probability instantly
           </p>
+          <Link href="/research" className="text-sm text-zinc-400 hover:text-white mt-2 inline-block">
+            AI trading repo research &rarr;
+          </Link>
         </div>
 
         <div className="grid md:grid-cols-2 gap-6">
