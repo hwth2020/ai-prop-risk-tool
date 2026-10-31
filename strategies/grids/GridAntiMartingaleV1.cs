@@ -74,6 +74,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsOverlay   = true;
                 StartBehavior = StartBehavior.ImmediatelySubmit;
                 BarsRequiredToTrade = 30;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;   // rejections are handled in OnOrderUpdate
                 Direction = GridAntiMartingaleDirection.FollowEma; FastPeriod = 12; SlowPeriod = 144;
                 Levels = 4; StepTicks = 40; StepGrowth = 1.0;
                 BaseQty = 1; LevelMult = 1.0; CycleLossMult = 1.0; MaxLossStreak = 20; AddQtyPerWin = 1; MaxQtyPerOrder = 5; MaxTotalContracts = 12;
@@ -105,7 +106,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     blockReason = "account " + Account.Name + " is not a Sim / Playback account -- live trading blocked";
                     Print(LogTag + " " + blockReason);
                 }
-                Print(LogTag + " build 5 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": direction " + Direction + ", up to " + Levels + " levels, trading " + EnableTrading);
+                Print(LogTag + " build 6 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": direction " + Direction + ", up to " + Levels + " levels, trading " + EnableTrading);
             }
             else if (State == State.Realtime)
             {
@@ -268,10 +269,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                                               double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
         {
             if (order.Name == "BTP") tpOrd = order;
-            if (orderState == OrderState.Rejected && order.Name != null && order.Name.Length >= 2 && order.Name[0] == 'B')
+            if (orderState == OrderState.Rejected && order.Name != null)
             {
-                Print(LogTag + " order " + order.Name + " REJECTED: " + error + " " + comment);
+                Print(LogTag + " REJECTED " + order.Name + " " + order.OrderAction + " x" + quantity + " " + order.OrderType + " @ " + limitPrice
+                    + " | error " + error + " | " + comment + " | own position " + accPos
+                    + ", strategy position " + Position.MarketPosition + " " + Position.Quantity + " | account " + (Account != null ? Account.Name : "?"));
                 if (order.Name == "B1") { inCycle = false; closing = false; }
+                else if (order.Name == "BTP" && inCycle) CloseCycle("take profit order rejected", true);
             }
         }
 

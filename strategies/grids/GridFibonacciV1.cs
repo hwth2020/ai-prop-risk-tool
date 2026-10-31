@@ -84,6 +84,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsOverlay   = true;
                 StartBehavior = StartBehavior.ImmediatelySubmit;
                 BarsRequiredToTrade = 30;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;   // rejections are handled in OnOrderUpdate
                 SwingLookback = 60; Ratios = "0.236,0.382,0.5,0.618,0.786"; TpExtension = 0.0; InvalidateExt = 0.1;
                 MinRangeTicks = 80; QtyPerLevel = 1; RebuildBars = 30;
                 MaxLossDollars     = 1500;
@@ -120,7 +121,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     blockReason = "account " + Account.Name + " is not a Sim / Playback account -- live trading blocked";
                     Print(LogTag + " " + blockReason);
                 }
-                Print(LogTag + " build 5 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
+                Print(LogTag + " build 6 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
             }
             else if (State == State.Realtime)
             {
@@ -352,18 +353,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             string oco = "G" + (++ordCounter).ToString(CultureInfo.InvariantCulture) + "_" + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture);
             int q; double px;
             if (DownOrder(out q, out px) && q > 0)
-                dnOrd = SubmitOrderUnmanaged(0, s < 0 ? OrderAction.BuyToCover : OrderAction.Buy, OrderType.Limit, q, Rnd(px), 0, oco, "GD" + ordCounter);
+                dnOrd = SubmitOrderUnmanaged(0, accPos < 0 ? OrderAction.BuyToCover : OrderAction.Buy, OrderType.Limit, q, Rnd(px), 0, oco, "GD" + ordCounter);
             if (UpOrder(out q, out px) && q > 0)
-                upOrd = SubmitOrderUnmanaged(0, s > 0 ? OrderAction.Sell : OrderAction.SellShort, OrderType.Limit, q, Rnd(px), 0, oco, "GU" + ordCounter);
+                upOrd = SubmitOrderUnmanaged(0, accPos > 0 ? OrderAction.Sell : OrderAction.SellShort, OrderType.Limit, q, Rnd(px), 0, oco, "GU" + ordCounter);
         }
 
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filledQty,
                                               double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
         {
-            if (orderState == OrderState.Rejected && order.Name != null && (order.Name.StartsWith("GD") || order.Name.StartsWith("GU")))
+            if (orderState == OrderState.Rejected && order.Name != null)
             {
-                Print(LogTag + " order " + order.Name + " REJECTED: " + error + " " + comment);
-                if (gridOn) Flatten("order rejected", true);
+                // Handled here instead of letting NinjaTrader terminate the strategy: print everything needed to see WHY it was rejected.
+                Print(LogTag + " REJECTED " + order.Name + " " + order.OrderAction + " x" + quantity + " " + order.OrderType + " @ " + limitPrice
+                    + " | error " + error + " | " + comment + " | grid state " + s + ", own position " + accPos
+                    + ", strategy position " + Position.MarketPosition + " " + Position.Quantity + " | account " + (Account != null ? Account.Name : "?"));
+                if (gridOn && order.Name != "GFLAT") Flatten("order rejected", true);
             }
         }
 
