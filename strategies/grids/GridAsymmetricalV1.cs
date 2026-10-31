@@ -62,6 +62,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnStateChange()
         {
+            if (DebugLog && State != State.SetDefaults) Print(LogTag + " state -> " + State + (CurrentBars != null && CurrentBars.Length > 0 ? ", bars " + CurrentBars[0] : ""));
             if (State == State.SetDefaults)
             {
                 Description = "Asymmetrical grid: unequal number, spacing or size of buy and sell levels to express a directional bias (unproven).";
@@ -81,6 +82,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EndTime            = 1555;
                 EnableTrading      = true;
                 AllowNonSimAccount = false;
+                DebugLog           = false;
             }
             else if (State == State.DataLoaded)
             {
@@ -108,6 +110,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
+            if (DebugLog && BarsInProgress == 0 && CurrentBar % 500 == 0) Print(LogTag + " heartbeat: bar " + CurrentBar + " " + Time[0] + " state " + State);
             if (BarsInProgress != 0 || CurrentBar < Math.Max(BarsRequiredToTrade, Warmup)) return;
             DateTime t = Time[0];
             if (t.Date != dayDate) { dayDate = t.Date; dayBase = realized; dayStopped = false; }
@@ -286,6 +289,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             CancelWorking();
             if (!gridOn || paused) return;
             if (++subsThisBar > 40) { Flatten("order storm (runaway order loop)", true); return; }
+            if (DebugLog) Print(LogTag + " " + Time[0] + " PlaceOrders state " + s + " price " + Close[0]);
             string oco = "G" + (++ordCounter).ToString(CultureInfo.InvariantCulture) + "_" + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture);
             int q; double px;
             if (DownOrder(out q, out px) && q > 0)
@@ -451,6 +455,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Allow Non-Sim Account", Description = "Keep OFF.", Order = 9, GroupName = "9. Risk")]
         public bool AllowNonSimAccount { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Debug Log", Description = "Write state changes, a heartbeat every 500 bars and every order to the NinjaScript Output window.", Order = 10, GroupName = "9. Risk")]
+        public bool DebugLog { get; set; }
         #endregion
     }
 }
