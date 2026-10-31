@@ -98,6 +98,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AllowNonSimAccount = false;
                 DebugLog           = false;
                 TradeHistory       = false;
+                UseMl              = false;
+                MlHorizonBars      = 30;
+                MlStepSigmas       = 0.5;
+                MlMinStepTicks     = 8;
+                MlBreakSigmas      = 1.0;
+                MlMaxVolRatio      = 2.0;
+                MlMaxTailZ         = 3.5;
             }
             else if (State == State.Configure)
             {
@@ -114,6 +121,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (double.TryParse(r, NumberStyles.Float, CultureInfo.InvariantCulture, out v) && v > 0 && v < 3) ratioList.Add(v);
                 }
                 ratioList.Sort();
+                ml = UseMl ? new BachelierModel(MlHorizonBars, TickSize) : null;
                 if (Account != null && !AllowNonSimAccount && !Account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
                     && !Account.Name.StartsWith("Playback", StringComparison.OrdinalIgnoreCase))
                 {
@@ -121,7 +129,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     blockReason = "account " + Account.Name + " is not a Sim / Playback account -- live trading blocked";
                     Print(LogTag + " " + blockReason);
                 }
-                Print(LogTag + " build 6 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
+                Print(LogTag + " build 7 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
             }
             else if (State == State.Realtime)
             {
@@ -149,6 +157,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             if (DebugLog && BarsInProgress == 0 && CurrentBar % 500 == 0) Print(LogTag + " heartbeat: bar " + CurrentBar + " " + Time[0] + " state " + State);
+            if (ml != null && BarsInProgress == 0 && IsFirstTickOfBar && CurrentBar >= 3)
+            {
+                ml.Update(Close[1] - Close[2], Time[1].Hour * 60 + Time[1].Minute);
+                if (DebugLog && ml.Ready && CurrentBar % 500 == 0) Print(LogTag + " " + MlText().Trim());
+            }
             if (BarsInProgress != 0 || CurrentBar < Math.Max(BarsRequiredToTrade, Warmup)) return;
             if (State == State.Historical && !TradeHistory) return;      // no historical orders: they cannot be carried over to live cleanly
             DateTime t = Time[0];
@@ -178,7 +191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (gridOn) Guards(cyc);
             if (gridOn && s == 0 && flat && newBar && RebuildDue()) { CancelWorking(); gridOn = false; }
-            if (!gridOn && !paused && flat && s == 0 && !dayStopped && inSession && newBar && AccountFlat()) TryStart();
+            if (!gridOn && !paused && flat && s == 0 && !dayStopped && inSession && newBar && AccountFlat() && MlAllowsStart()) TryStart();
             if (newBar && gridOn) StrategyBar();
             if (newBar) DrawStats(cyc);
         }
@@ -294,8 +307,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             double px = Close[0];
             if (MaxLossDollars > 0 && cyc <= -MaxLossDollars) { Flatten("max loss per cycle", true); return; }
-            if (s > 0 && N > 0 && px <= Lb[N] - BreakTicks * TickSize) { Flatten("range break (long side)", true); return; }
-            if (s < 0 && M > 0 && px >= Ls[M] + BreakTicks * TickSize) { Flatten("range break (short side)", true); return; }
+            if (s > 0 && N > 0 && px <= Lb[N] - BreakDist()) { Flatten("range break (long side)", true); return; }
+            if (s < 0 && M > 0 && px >= Ls[M] + BreakDist()) { Flatten("range break (short side)", true); return; }
             ExtraGuard(cyc);
         }
 
@@ -436,9 +449,202 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + "\nstate " + s + " (" + (s > 0 ? "long " + s + " lvl" : s < 0 ? "short " + (-s) + " lvl" : "flat") + "), position " + accPos
                 + "  |  cycle $" + cyc.ToString("F0") + "  |  realized $" + realized.ToString("F0")
                 + "\ngrids completed " + cycles + " (" + wins + " profitable)  |  last: " + lastNote
-                + "\nUNPROVEN -- sim only. Commissions not included.";
+                + MlText() + "\nUNPROVEN -- sim only. Commissions not included.";
             Draw.TextFixed(this, "GRIDstats", text, TextPosition.TopLeft, Brushes.White,
                 new SimpleFont("Arial", 11), Brushes.Transparent, Brushes.Black, 70);
+        }
+
+        // ======================================================================================================
+        //  Bachelier volatility model (optional, UseMl). Not a direction predictor: Bachelier's point is that the next
+        //  move is unpredictable, but its SIZE is not -- price spread grows like sigma x sqrt(t). The model learns
+        //  sigma online: a ridge regression (refit every 25 bars on the last 3000 samples, shrunk toward "the next
+        //  sigma = the last 50-bar sigma") predicts the RMS bar move of the next Horizon bars from recent volatility
+        //  at 3 scales, the last move and time of day. It also measures how fat the real tails are (z = move / the
+        //  forecast made before it) so guards can be wider than a normal distribution would suggest.
+        // ======================================================================================================
+        private sealed class BachelierModel
+        {
+            private const int K = 7;
+            private const double Alpha = 5.0;
+            private const int Window = 3000;
+            private readonly int horizon;
+            private readonly double tick;
+            private readonly double[] w = new double[K], w0 = new double[K];
+            private readonly List<double> rets = new List<double>();
+            private readonly Queue<double[]> pendX = new Queue<double[]>();
+            private readonly Queue<int> pendIdx = new Queue<int>();
+            private readonly List<double[]> sx = new List<double[]>();
+            private readonly List<double> sy = new List<double>();
+            private readonly double[] zbuf = new double[2000];
+            private int zn, zpos, nBars, nUpdates;
+            private double lastSigma;
+            public double SigmaPerBar, SigmaLong, TailZ99 = 2.576, Frac2, Frac3, Kurt;
+            public bool Ready { get { return nUpdates >= 200; } }
+
+            public BachelierModel(int horizonBars, double tickSize)
+            {
+                horizon = Math.Max(2, horizonBars); tick = tickSize;
+                w0[2] = 1.0;                       // prior: next sigma = last 50-bar sigma
+                Array.Copy(w0, w, K);
+            }
+
+            private double Rms(int n)
+            {
+                n = Math.Min(n, rets.Count);
+                if (n <= 0) return 0;
+                double ss = 0;
+                for (int i = rets.Count - n; i < rets.Count; i++) ss += rets[i] * rets[i];
+                return Math.Sqrt(ss / n);
+            }
+
+            private double[] Features(double r, int minuteOfDay)
+            {
+                double e = 0.25 * tick;
+                double s50 = Math.Max(Rms(50), e);
+                double[] x = new double[K];
+                x[0] = 1.0;
+                x[1] = Math.Log(Math.Max(Rms(10), e));
+                x[2] = Math.Log(s50);
+                x[3] = Math.Log(Math.Max(Rms(200), e));
+                x[4] = Math.Min(5.0, Math.Abs(r) / s50);
+                x[5] = Math.Sin(2 * Math.PI * minuteOfDay / 1440.0);
+                x[6] = Math.Cos(2 * Math.PI * minuteOfDay / 1440.0);
+                return x;
+            }
+
+            // r = the closed bar's price change in points; minuteOfDay = its time
+            public void Update(double r, int minuteOfDay)
+            {
+                rets.Add(r); nBars++;
+                if (rets.Count > 700) rets.RemoveAt(0);
+
+                // calibration: the move versus the forecast that was made BEFORE it
+                if (lastSigma > 0 && nUpdates > 0)
+                {
+                    zbuf[zpos] = r / lastSigma;
+                    zpos = (zpos + 1) % zbuf.Length;
+                    if (zn < zbuf.Length) zn++;
+                }
+
+                // learning: the sample made `horizon` bars ago now has its answer (RMS move of the bars since)
+                if (pendIdx.Count > 0 && nBars - pendIdx.Peek() >= horizon)
+                {
+                    double[] x = pendX.Dequeue(); pendIdx.Dequeue();
+                    sx.Add(x); sy.Add(Math.Log(Math.Max(Rms(horizon), 0.25 * tick)));
+                    if (sx.Count > Window) { sx.RemoveAt(0); sy.RemoveAt(0); }
+                    nUpdates++;
+                    if (nUpdates >= 100 && nUpdates % 25 == 0) Fit();
+                }
+
+                // forecast for the coming bars
+                if (rets.Count >= 60)
+                {
+                    double[] x = Features(r, minuteOfDay);
+                    double s50 = Rms(50), yh = 0;
+                    for (int k = 0; k < K; k++) yh += w[k] * x[k];
+                    double sh = Math.Exp(Math.Max(-20.0, Math.Min(20.0, yh)));
+                    sh = Math.Min(Math.Max(sh, 0.25 * s50), 4.0 * s50);
+                    lastSigma = sh; SigmaPerBar = sh; SigmaLong = Rms(600);
+                    pendX.Enqueue(x); pendIdx.Enqueue(nBars);
+                    if (nBars % 25 == 0 && zn >= 200) Calibrate();
+                }
+            }
+
+            private void Fit()
+            {
+                double[,] A = new double[K, K + 1];
+                for (int s = 0; s < sx.Count; s++)
+                {
+                    double[] x = sx[s];
+                    for (int i = 0; i < K; i++)
+                    {
+                        A[i, K] += x[i] * sy[s];
+                        for (int j = 0; j < K; j++) A[i, j] += x[i] * x[j];
+                    }
+                }
+                for (int i = 0; i < K; i++) { A[i, i] += Alpha; A[i, K] += Alpha * w0[i]; }
+                // Gauss elimination with partial pivoting
+                for (int c = 0; c < K; c++)
+                {
+                    int p = c;
+                    for (int r = c + 1; r < K; r++) if (Math.Abs(A[r, c]) > Math.Abs(A[p, c])) p = r;
+                    if (Math.Abs(A[p, c]) < 1e-12) return;
+                    if (p != c) for (int j = 0; j <= K; j++) { double t = A[c, j]; A[c, j] = A[p, j]; A[p, j] = t; }
+                    for (int r = c + 1; r < K; r++)
+                    {
+                        double f = A[r, c] / A[c, c];
+                        for (int j = c; j <= K; j++) A[r, j] -= f * A[c, j];
+                    }
+                }
+                double[] sol = new double[K];
+                for (int i = K - 1; i >= 0; i--)
+                {
+                    double v = A[i, K];
+                    for (int j = i + 1; j < K; j++) v -= A[i, j] * sol[j];
+                    sol[i] = v / A[i, i];
+                }
+                for (int i = 0; i < K; i++) if (double.IsNaN(sol[i]) || double.IsInfinity(sol[i])) return;
+                Array.Copy(sol, w, K);
+            }
+
+            private void Calibrate()
+            {
+                int n = zn;
+                double[] a = new double[n];
+                double m2 = 0, m4 = 0; int c2 = 0, c3 = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    double z = zbuf[i];
+                    a[i] = Math.Abs(z);
+                    m2 += z * z; m4 += z * z * z * z;
+                    if (a[i] > 2.0) c2++;
+                    if (a[i] > 3.0) c3++;
+                }
+                Array.Sort(a);
+                TailZ99 = a[(int)(0.99 * (n - 1))];
+                Frac2 = c2 / (double)n; Frac3 = c3 / (double)n;
+                m2 /= n; m4 /= n;
+                Kurt = m2 > 0 ? m4 / (m2 * m2) - 3.0 : 0.0;
+            }
+        }
+
+        private BachelierModel ml;
+
+        private bool MlOn() { return UseMl && ml != null && ml.Ready; }
+        private double SigmaH() { return ml.SigmaPerBar * Math.Sqrt(Math.Max(1, MlHorizonBars)); }      // Bachelier: spread ~ sigma x sqrt(t)
+
+        // grid step: ML step (sigma x sqrt(horizon) x MlStepSigmas, snapped to ticks) when the model is on and trained
+        private double StepFor(double basePx)
+        {
+            if (!MlOn()) return basePx;
+            double px = MlStepSigmas * SigmaH();
+            return Math.Max(MlMinStepTicks * TickSize, Math.Round(px / TickSize) * TickSize);
+        }
+
+        // how far beyond the outermost level before the grid is cut: widened by the measured fat tails
+        private double BreakDist()
+        {
+            double d = BreakTicks * TickSize;
+            if (!MlOn()) return d;
+            return Math.Max(d, MlBreakSigmas * SigmaH() * Math.Max(1.0, ml.TailZ99 / 2.576));
+        }
+
+        // regime filter: do not start a grid into a volatility spike or a fat-tailed regime
+        private bool MlAllowsStart()
+        {
+            if (!MlOn()) return true;
+            if (ml.SigmaPerBar > MlMaxVolRatio * ml.SigmaLong) return false;
+            if (ml.TailZ99 > MlMaxTailZ) return false;
+            return true;
+        }
+
+        private string MlText()
+        {
+            if (!UseMl || ml == null) return "";
+            if (!ml.Ready) return "\nML vol model: learning (needs about 300 bars of history)";
+            return "\nML vol: sigma/bar " + ml.SigmaPerBar.ToString("F2") + " pts, x sqrt(" + MlHorizonBars + ") = " + SigmaH().ToString("F1")
+                + " pts | P(|z|>2) " + (ml.Frac2 * 100).ToString("F1") + "% (normal 4.6%), 99% z " + ml.TailZ99.ToString("F2")
+                + " (normal 2.58), excess kurtosis " + ml.Kurt.ToString("F1") + (MlAllowsStart() ? "" : "  -> new grids blocked");
         }
 
         #region Properties
@@ -526,6 +732,40 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Trade Historical Bars", Description = "OFF (recommended on a chart / Playback): no orders while NinjaTrader replays history, so no historical orders have to be carried over to live. ON only for Strategy Analyzer backtests.", Order = 11, GroupName = "9. Risk")]
         public bool TradeHistory { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use ML Volatility Model", Description = "Bachelier-style online model: forecasts how far price will move (sigma x sqrt(t)), measures the real fat tails. Sizes the grid step, widens the break guard and blocks new grids in volatility spikes / fat-tailed regimes. OFF = the plain strategy.", Order = 1, GroupName = "8. ML (Bachelier)")]
+        public bool UseMl { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2, 500)]
+        [Display(Name = "Horizon (bars)", Description = "The model predicts the RMS move over this many bars; spread scales with its square root.", Order = 2, GroupName = "8. ML (Bachelier)")]
+        public int MlHorizonBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.05, 10.0)]
+        [Display(Name = "Step = sigma x sqrt(horizon) x", Description = "Grid step as a fraction of the predicted horizon spread.", Order = 3, GroupName = "8. ML (Bachelier)")]
+        public double MlStepSigmas { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 5000)]
+        [Display(Name = "Min Step with ML (ticks)", Order = 4, GroupName = "8. ML (Bachelier)")]
+        public int MlMinStepTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, 20.0)]
+        [Display(Name = "Break Distance (x horizon spread)", Description = "Flatten when price is this many horizon-sigmas (scaled up by measured tail fatness) beyond the outermost level. Never less than Break Ticks.", Order = 5, GroupName = "8. ML (Bachelier)")]
+        public double MlBreakSigmas { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1.0, 20.0)]
+        [Display(Name = "Block Starts if Vol > x Long-run", Description = "No new grid when predicted sigma is above this multiple of the 600-bar sigma.", Order = 6, GroupName = "8. ML (Bachelier)")]
+        public double MlMaxVolRatio { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2.0, 20.0)]
+        [Display(Name = "Block Starts if 99% Tail z >", Description = "No new grid when the measured 99th percentile of |move / forecast| exceeds this (a normal distribution gives 2.58).", Order = 7, GroupName = "8. ML (Bachelier)")]
+        public double MlMaxTailZ { get; set; }
         #endregion
     }
 }

@@ -31,3 +31,16 @@ limit, optional session window, Sim/Playback-only account guard in real time.
 - Partial fills are not handled specially; keep whole-contract quantities. Commission is not in the on-chart P&L.
 - `GridPriceActionV1` does not implement the breakout (buy-stop above / sell-stop below) variant.
 - Grids and especially the martingale lose big in a strong trend: the loss limits matter more than the entry rules.
+
+## ML volatility model (build 7, optional, off by default)
+Every grid file has a "8. ML (Bachelier)" group. `Use ML Volatility Model` adds an online-learning model that does NOT predict
+direction (Bachelier: the next move is unpredictable) but the SIZE of moves: spread grows like sigma x sqrt(t).
+- A ridge regression (refit every 25 bars on the last 3000 samples, shrunk toward "next sigma = last 50-bar sigma") predicts the
+  RMS bar move of the next `Horizon` bars from volatility at 3 scales, the last move and time of day.
+- It measures real tail fatness: z = move / the forecast made before it (P(|z|>2) vs the normal 4.6 %, 99 % z vs 2.58, excess kurtosis).
+- Uses: grid step = `Step = sigma x sqrt(horizon) x k` (ticks floor), break guard widened by the measured tails, and new grids are
+  blocked in volatility spikes or fat-tailed regimes. Martingale / anti-martingale: step and take profit scale with it.
+- It trains on every historical bar (even with Trade Historical Bars off) and needs about 300 bars before it is "Ready"; until then
+  the strategy behaves exactly as with the model off. The stats box shows its current readings.
+- Prototype check on synthetic volatility-clustered data: ~12 % lower volatility-forecast error than the plain 50-bar baseline.
+  It has not been validated on real NQ data -- judge it with the stats box before trusting it.
