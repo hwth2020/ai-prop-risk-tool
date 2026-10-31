@@ -108,6 +108,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 Print(LogTag + " " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
             }
+            else if (State == State.Realtime)
+            {
+                // Orders placed while NinjaTrader replayed history become LIVE orders now. Swap the stored references,
+                // otherwise cancelling them later disables the strategy ("modify a historical order that has transitioned to live").
+                try
+                {
+                    if (dnOrd != null) dnOrd = GetRealtimeOrder(dnOrd);
+                    if (upOrd != null) upOrd = GetRealtimeOrder(upOrd);
+                }
+                catch (Exception ex) { Print(LogTag + " realtime order transition: " + ex.Message); dnOrd = upOrd = null; }
+            }
             else if (State == State.Terminated)
             {
                 try

@@ -100,6 +100,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 Print(LogTag + " " + Instrument.FullName + " " + BarsPeriod + ": direction " + Direction + ", up to " + Levels + " levels, trading " + EnableTrading);
             }
+            else if (State == State.Realtime)
+            {
+                // Orders placed while NinjaTrader replayed history become LIVE orders now. Swap the stored references,
+                // otherwise changing / cancelling them later disables the strategy ("modify a historical order that has transitioned to live").
+                try
+                {
+                    if (tpOrd != null) tpOrd = GetRealtimeOrder(tpOrd);
+                    for (int i = 0; i < lvlOrds.Count; i++)
+                        if (lvlOrds[i] != null) lvlOrds[i] = GetRealtimeOrder(lvlOrds[i]);
+                    lvlOrds.RemoveAll(o => o == null);
+                }
+                catch (Exception ex) { Print(LogTag + " realtime order transition: " + ex.Message); tpOrd = null; lvlOrds.Clear(); }
+            }
             else if (State == State.Terminated)
             {
                 try
