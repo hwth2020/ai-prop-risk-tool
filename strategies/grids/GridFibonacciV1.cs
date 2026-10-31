@@ -1,0 +1,479 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.Linq;
+using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// GridFibonacciV1 -- Fibonacci grid -- NinjaTrader 8 strategy (UNPROVEN, sim / playback only)
+//
+//  Takes the highest high / lowest low of the last Swing Lookback bars. If the high is the more recent extreme (uptrend) the
+//  buy levels are the retracements High - ratio x Range (default 23.6 / 38.2 / 50 / 61.8 / 78.6 %), each exiting at the level
+//  above it and the first at the swing high plus TP Extension x Range (0 = the high; 0.272 / 0.618 = Fibonacci extensions).
+//  In a downtrend the sell levels are Low + ratio x Range, mirrored. Only trades WITH the swing. Levels the price has already
+//  passed are skipped. The swing is invalid beyond Invalidate x Range outside it (flatten). Rebuilt every Rebuild Bars when flat.
+//  The description suggests extra confluence (candles, volume, trend lines); this version uses the swing structure only.
+//
+//  How the grid works (shared by the "ladder" grids in this folder; UNMANAGED orders, NET position):
+//   - Entry levels sit below the anchor (buy levels, Lb[1..N]) and/or above it (sell levels, Ls[1..M]).
+//   - Every level has its own exit: the NEXT level toward the anchor (level 1 exits at the anchor / exit price), so each
+//     round trip earns about one grid step. Only two limit orders (OCO) are working at any time: the next entry and the
+//     next exit. When one fills the grid state moves by one level and the pair is replaced.
+//   - Because NinjaTrader nets positions per instrument, buy and sell levels never hold opposite positions at once.
+//   - Guards: max loss per grid cycle, range break (price beyond the outermost level + Break Ticks) -> flatten and pause,
+//     daily loss limit, optional session window.
+//  Backtests (Strategy Analyzer) only see one level per bar unless you use tick data -- use Tick Replay or 1 tick series.
+//  Partial fills are not handled specially; use whole-contract quantities. Commissions are NOT in the on-chart P&L.
+//  Safety: Enable Trading can be switched off; in real time only Sim / Playback accounts unless allowed. UNPROVEN.
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+
+    public class GridFibonacciV1 : Strategy
+    {
+        private const string LogTag = "[GridFibonacciV1]";
+
+        // grid: [0] = exit anchor of the side, [1..N] / [1..M] = entry levels, quantities in Qb / Qs
+        private double[] Lb = new double[1], Ls = new double[1];
+        private int[] Qb = new int[1], Qs = new int[1];
+        private int N, M;
+        private int s;                          // grid state: +k = k buy levels open (long), -k = k sell levels open (short)
+        private bool gridOn, paused, startedOnce, flattening, tradingAllowed = true, dayStopped;
+        private int pauseLeft, ordCounter, barsSinceBuild, cycles, wins, gridDir;
+        private Order dnOrd, upOrd;
+        private int accPos;                     // own position accounting (works in backtest and real time)
+        private double accAvg, realized, cycleBase, dayBase, cyclePeak;
+        private DateTime dayDate = DateTime.MinValue;
+        private string blockReason = "", lastNote = "idle";
+        private List<double> ratioList = new List<double>();
+        private double swingH, swingL;
+
+        private int Warmup { get { return SwingLookback + 2; } }
+        private double Rnd(double v) { return Instrument.MasterInstrument.RoundToTickSize(v); }
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "Fibonacci grid: buys retracement levels of the latest swing in the swing's direction, exits at the swing extreme / extension (unproven).";
+                Name        = "GridFibonacciV1";
+                Calculate   = Calculate.OnEachTick;
+                IsUnmanaged = true;
+                IsOverlay   = true;
+                StartBehavior = StartBehavior.WaitUntilFlat;
+                BarsRequiredToTrade = 30;
+                SwingLookback = 60; Ratios = "0.236,0.382,0.5,0.618,0.786"; TpExtension = 0.0; InvalidateExt = 0.1;
+                MinRangeTicks = 80; QtyPerLevel = 1; RebuildBars = 30;
+                MaxLossDollars     = 1500;
+                DailyLossLimit     = 2000;
+                BreakTicks         = 40;
+                PauseBars          = 10;
+                UseSession         = false;
+                StartTime          = 930;
+                EndTime            = 1555;
+                EnableTrading      = true;
+                AllowNonSimAccount = false;
+            }
+            else if (State == State.DataLoaded)
+            {
+                ratioList.Clear();
+                foreach (string r in (Ratios ?? "").Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    double v;
+                    if (double.TryParse(r, NumberStyles.Float, CultureInfo.InvariantCulture, out v) && v > 0 && v < 3) ratioList.Add(v);
+                }
+                ratioList.Sort();
+                if (Account != null && !AllowNonSimAccount && !Account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
+                    && !Account.Name.StartsWith("Playback", StringComparison.OrdinalIgnoreCase))
+                {
+                    tradingAllowed = false;
+                    blockReason = "account " + Account.Name + " is not a Sim / Playback account -- live trading blocked";
+                    Print(LogTag + " " + blockReason);
+                }
+                Print(LogTag + " " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
+            }
+            else if (State == State.Terminated)
+            {
+                try
+                {
+                    if (Position != null && Position.MarketPosition != MarketPosition.Flat)
+                        Print(LogTag + " WARNING: stopped with an open position (" + Position.MarketPosition + " " + Position.Quantity
+                            + ") -- the grid orders are cancelled; manage or close it in the Positions tab.");
+                }
+                catch { }
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (BarsInProgress != 0 || CurrentBar < Math.Max(BarsRequiredToTrade, Warmup)) return;
+            DateTime t = Time[0];
+            if (t.Date != dayDate) { dayDate = t.Date; dayBase = realized; dayStopped = false; }
+            bool newBar = IsFirstTickOfBar;
+            if (newBar)
+            {
+                barsSinceBuild++;
+                if (paused && --pauseLeft <= 0) paused = false;
+            }
+
+            bool flat = Position.MarketPosition == MarketPosition.Flat;
+            if (flat) flattening = false;
+            if (flat && s == 0) { cycleBase = realized; cyclePeak = 0; }
+            double cyc = (realized - cycleBase) + Unrealized();
+            if (cyc > cyclePeak) cyclePeak = cyc;
+
+            if (!EnableTrading || (State == State.Realtime && !tradingAllowed)) { if (newBar) DrawStats(cyc); return; }
+
+            int hm = t.Hour * 100 + t.Minute;
+            bool inSession = !UseSession || (hm >= StartTime && hm < EndTime);
+            if (UseSession && hm >= EndTime && (gridOn || !flat)) Flatten("session end", false);
+            double dayPnl = (realized - dayBase) + Unrealized();
+            if (DailyLossLimit > 0 && dayPnl <= -DailyLossLimit && !dayStopped) { dayStopped = true; Flatten("daily loss limit", false); }
+
+            if (gridOn) Guards(cyc);
+            if (gridOn && s == 0 && flat && newBar && RebuildDue()) { CancelWorking(); gridOn = false; }
+            if (!gridOn && !paused && flat && s == 0 && !dayStopped && inSession && newBar) TryStart();
+            if (newBar && gridOn) StrategyBar();
+            if (newBar) DrawStats(cyc);
+        }
+
+        // ---- strategy specific --------------------------------------------------------------------------------
+        private bool AllowStart()
+        {
+            return true;
+        }
+
+        private bool BuildGrid()
+        {
+            if (ratioList.Count == 0) return false;
+            int lb = Math.Min(SwingLookback, CurrentBar - 1);
+            double H = double.MinValue, L = double.MaxValue; int iH = 0, iL = 0;
+            for (int i = 1; i <= lb; i++)
+            {
+                if (High[i] > H) { H = High[i]; iH = i; }
+                if (Low[i] < L) { L = Low[i]; iL = i; }
+            }
+            double R = H - L;
+            if (R < MinRangeTicks * TickSize) return false;
+            swingH = H; swingL = L;
+            var lv = new List<double>();
+            if (iH < iL)                    // the high is more recent: uptrend, buy the retracements
+            {
+                gridDir = 1;
+                foreach (double r in ratioList) lv.Add(H - r * R);
+                return BuildSides(H + TpExtension * R, lv, QtyPerLevel, H, new List<double>(), 0);
+            }
+            gridDir = -1;                   // the low is more recent: downtrend, sell the retracements
+            foreach (double r in ratioList) lv.Add(L + r * R);
+            return BuildSides(L, new List<double>(), 0, L - TpExtension * R, lv, QtyPerLevel);
+        }
+
+        private bool RebuildDue()
+        {
+            return barsSinceBuild >= RebuildBars;
+        }
+
+        private void StrategyBar()
+        {
+
+        }
+
+        private void ExtraGuard(double cyc)
+        {
+            double R = swingH - swingL;
+            if (accPos == 0 || R <= 0) return;
+            if (gridDir > 0 && Close[0] < swingL - InvalidateExt * R) Flatten("swing low broken", true);
+            else if (gridDir < 0 && Close[0] > swingH + InvalidateExt * R) Flatten("swing high broken", true);
+        }
+
+        // ---- grid construction helpers --------------------------------------------------------------------------
+        private List<double> Ladder(double from, double step, int n, int dir)
+        {
+            var l = new List<double>();
+            for (int i = 1; i <= n; i++) l.Add(from + dir * i * step);
+            return l;
+        }
+
+        private bool BuildSides(double exitL, List<double> lv, int qL, double exitS, List<double> sv, int qS)
+        {
+            N = Math.Min(lv.Count, 40); M = Math.Min(sv.Count, 40);
+            Lb = new double[N + 1]; Qb = new int[N + 1]; Ls = new double[M + 1]; Qs = new int[M + 1];
+            Lb[0] = Rnd(exitL); Ls[0] = Rnd(exitS);
+            for (int i = 0; i < N; i++) { Lb[i + 1] = Rnd(lv[i]); Qb[i + 1] = qL; }
+            for (int i = 0; i < M; i++) { Ls[i + 1] = Rnd(sv[i]); Qs[i + 1] = qS; }
+            TrimPassed(Close[0]);
+            return N + M > 0;
+        }
+
+        // Levels the price has already passed (a buy level at/above the price, a sell level at/below it) would fill at
+        // once at market. Drop them; the next level then exits at the dropped level.
+        private void TrimPassed(double price)
+        {
+            while (N > 0 && Lb[1] >= price)
+            {
+                for (int i = 0; i < N; i++) Lb[i] = Lb[i + 1];
+                for (int i = 1; i < N; i++) Qb[i] = Qb[i + 1];
+                N--;
+                Array.Resize(ref Lb, N + 1); Array.Resize(ref Qb, N + 1);
+            }
+            while (M > 0 && Ls[1] <= price)
+            {
+                for (int i = 0; i < M; i++) Ls[i] = Ls[i + 1];
+                for (int i = 1; i < M; i++) Qs[i] = Qs[i + 1];
+                M--;
+                Array.Resize(ref Ls, M + 1); Array.Resize(ref Qs, M + 1);
+            }
+        }
+
+        private void TryStart()
+        {
+            if (!AllowStart()) return;
+            if (!BuildGrid()) { lastNote = "no grid could be built"; return; }
+            s = 0; gridOn = true; startedOnce = true; barsSinceBuild = 0;
+            lastNote = "grid started: " + N + " buy / " + M + " sell levels";
+            Print(LogTag + " " + Time[0] + " " + lastNote + " | buy " + LevelText(Lb, N) + " | sell " + LevelText(Ls, M));
+            DrawGrid();
+            PlaceOrders();
+        }
+
+        private string LevelText(double[] a, int n)
+        {
+            var parts = new List<string>();
+            for (int i = 0; i <= n; i++) parts.Add(a[i].ToString("F2", CultureInfo.InvariantCulture));
+            return string.Join(",", parts);
+        }
+
+        // ---- risk -------------------------------------------------------------------------------------------------
+        private void Guards(double cyc)
+        {
+            double px = Close[0];
+            if (MaxLossDollars > 0 && cyc <= -MaxLossDollars) { Flatten("max loss per cycle", true); return; }
+            if (s > 0 && N > 0 && px <= Lb[N] - BreakTicks * TickSize) { Flatten("range break (long side)", true); return; }
+            if (s < 0 && M > 0 && px >= Ls[M] + BreakTicks * TickSize) { Flatten("range break (short side)", true); return; }
+            ExtraGuard(cyc);
+        }
+
+        private void Flatten(string reason, bool pauseAfter)
+        {
+            CancelWorking();
+            if (!flattening)
+            {
+                if (Position.MarketPosition == MarketPosition.Long)
+                { SubmitOrderUnmanaged(0, OrderAction.Sell, OrderType.Market, Position.Quantity, 0, 0, "", "GFLAT"); flattening = true; }
+                else if (Position.MarketPosition == MarketPosition.Short)
+                { SubmitOrderUnmanaged(0, OrderAction.BuyToCover, OrderType.Market, Position.Quantity, 0, 0, "", "GFLAT"); flattening = true; }
+            }
+            gridOn = false; s = 0;
+            if (pauseAfter) { paused = true; pauseLeft = PauseBars; }
+            lastNote = "flattened: " + reason;
+            Print(LogTag + " " + Time[0] + " FLATTEN -- " + reason);
+        }
+
+        // ---- orders -------------------------------------------------------------------------------------------------
+        private static bool IsLive(Order o)
+        {
+            return o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted || o.OrderState == OrderState.PartFilled
+                || o.OrderState == OrderState.Submitted || o.OrderState == OrderState.ChangePending || o.OrderState == OrderState.ChangeSubmitted;
+        }
+
+        private void CancelWorking()
+        {
+            if (dnOrd != null && IsLive(dnOrd)) CancelOrder(dnOrd);
+            if (upOrd != null && IsLive(upOrd)) CancelOrder(upOrd);
+            dnOrd = upOrd = null;
+        }
+
+        // next order when price falls one level / rises one level, from the current grid state s
+        private bool DownOrder(out int q, out double px)
+        {
+            q = 0; px = 0;
+            if (s >= 0) { if (s + 1 > N) return false; q = Qb[s + 1]; px = Lb[s + 1]; return true; }
+            int b = -s; q = Qs[b]; px = Ls[b - 1]; return true;
+        }
+
+        private bool UpOrder(out int q, out double px)
+        {
+            q = 0; px = 0;
+            if (s <= 0) { if (-s + 1 > M) return false; q = Qs[-s + 1]; px = Ls[-s + 1]; return true; }
+            q = Qb[s]; px = Lb[s - 1]; return true;
+        }
+
+        private void PlaceOrders()
+        {
+            CancelWorking();
+            if (!gridOn || paused) return;
+            string oco = "G" + (++ordCounter).ToString(CultureInfo.InvariantCulture) + "_" + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture);
+            int q; double px;
+            if (DownOrder(out q, out px) && q > 0)
+                dnOrd = SubmitOrderUnmanaged(0, s < 0 ? OrderAction.BuyToCover : OrderAction.Buy, OrderType.Limit, q, Rnd(px), 0, oco, "GD" + ordCounter);
+            if (UpOrder(out q, out px) && q > 0)
+                upOrd = SubmitOrderUnmanaged(0, s > 0 ? OrderAction.Sell : OrderAction.SellShort, OrderType.Limit, q, Rnd(px), 0, oco, "GU" + ordCounter);
+        }
+
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filledQty,
+                                              double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
+        {
+            if (orderState == OrderState.Rejected && order.Name != null && (order.Name.StartsWith("GD") || order.Name.StartsWith("GU")))
+            {
+                Print(LogTag + " order " + order.Name + " REJECTED: " + error + " " + comment);
+                if (gridOn) Flatten("order rejected", true);
+            }
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity,
+                                                  MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            try
+            {
+                Order o = execution.Order;
+                if (o == null) return;
+                bool buy = o.OrderAction == OrderAction.Buy || o.OrderAction == OrderAction.BuyToCover;
+                Book(buy, price, quantity);
+                if (o.OrderState != OrderState.Filled || !gridOn) return;
+                string n = o.Name ?? "";
+                if (n.StartsWith("GD")) { s++; Transition(); }
+                else if (n.StartsWith("GU")) { s--; Transition(); }
+            }
+            catch (Exception ex) { Print(LogTag + " execution error: " + ex.Message); }
+        }
+
+        private void Transition()
+        {
+            if (s == 0 && accPos == 0) { cycles++; if (realized - cycleBase > 0) wins++; }
+            PlaceOrders();
+        }
+
+        private void Book(bool buy, double price, int qty)
+        {
+            double pv = Instrument.MasterInstrument.PointValue;
+            int sg = buy ? 1 : -1, rem = qty;
+            if (accPos == 0 || Math.Sign(accPos) == sg)
+            {
+                accAvg = (accAvg * Math.Abs(accPos) + price * rem) / (Math.Abs(accPos) + rem);
+                accPos += sg * rem;
+            }
+            else
+            {
+                int closing = Math.Min(rem, Math.Abs(accPos));
+                realized += (price - accAvg) * Math.Sign(accPos) * closing * pv;
+                accPos += sg * closing; rem -= closing;
+                if (accPos == 0) accAvg = 0;
+                if (rem > 0) { accAvg = price; accPos = sg * rem; }
+            }
+        }
+
+        private double Unrealized()
+        {
+            return accPos == 0 ? 0 : (Close[0] - accAvg) * accPos * Instrument.MasterInstrument.PointValue;
+        }
+
+        // ---- drawing --------------------------------------------------------------------------------------------------
+        private void DrawGrid()
+        {
+            for (int j = 1; j <= 40; j++) { RemoveDrawObject("GRb" + j); RemoveDrawObject("GRs" + j); }
+            RemoveDrawObject("GRa");
+            for (int j = 1; j <= N; j++) Draw.HorizontalLine(this, "GRb" + j, Lb[j], Brushes.SeaGreen);
+            for (int j = 1; j <= M; j++) Draw.HorizontalLine(this, "GRs" + j, Ls[j], Brushes.IndianRed);
+            Draw.HorizontalLine(this, "GRa", N > 0 ? Lb[0] : Ls[0], Brushes.DodgerBlue);
+        }
+
+        private void DrawStats(double cyc)
+        {
+            string text = Name + "  |  " + (!EnableTrading ? "OFF" : (State == State.Realtime && !tradingAllowed) ? "BLOCKED" : gridOn ? "GRID ON" : paused ? "PAUSED" : "WAITING")
+                + "\nstate " + s + " (" + (s > 0 ? "long " + s + " lvl" : s < 0 ? "short " + (-s) + " lvl" : "flat") + "), position " + accPos
+                + "  |  cycle $" + cyc.ToString("F0") + "  |  realized $" + realized.ToString("F0")
+                + "\ngrids completed " + cycles + " (" + wins + " profitable)  |  last: " + lastNote
+                + "\nUNPROVEN -- sim only. Commissions not included.";
+            Draw.TextFixed(this, "GRIDstats", text, TextPosition.TopLeft, Brushes.White,
+                new SimpleFont("Arial", 11), Brushes.Transparent, Brushes.Black, 70);
+        }
+
+        #region Properties
+        [NinjaScriptProperty]
+        [Range(10, 5000)]
+        [Display(Name = "Swing Lookback (bars)", Description = "", Order = 1, GroupName = "1. Grid")]
+        public int SwingLookback { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Retracement Ratios (comma-separated)", Description = "Fractions of the swing range, e.g. 0.236,0.382,0.5,0.618,0.786.", Order = 2, GroupName = "1. Grid")]
+        public string Ratios { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, 5.0)]
+        [Display(Name = "TP Extension (x range)", Description = "0 = take profit at the swing extreme; 0.272 / 0.618 = extension beyond it.", Order = 3, GroupName = "1. Grid")]
+        public double TpExtension { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, 5.0)]
+        [Display(Name = "Invalidate Beyond (x range)", Description = "Flatten when price breaks the swing by this fraction of its range.", Order = 4, GroupName = "1. Grid")]
+        public double InvalidateExt { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100000)]
+        [Display(Name = "Min Swing Range (ticks)", Description = "", Order = 5, GroupName = "1. Grid")]
+        public int MinRangeTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 50)]
+        [Display(Name = "Contracts per Level", Description = "", Order = 6, GroupName = "1. Grid")]
+        public int QtyPerLevel { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100000)]
+        [Display(Name = "Rebuild Bars", Description = "", Order = 7, GroupName = "1. Grid")]
+        public int RebuildBars { get; set; }
+
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Max Loss per Grid Cycle ($, 0 = off)", Description = "Flatten and pause when the open grid loses this much.", Order = 1, GroupName = "9. Risk")]
+        public double MaxLossDollars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Daily Loss Limit ($, 0 = off)", Order = 2, GroupName = "9. Risk")]
+        public double DailyLossLimit { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 5000)]
+        [Display(Name = "Break Ticks", Description = "Flatten when price goes this many ticks beyond the outermost open level.", Order = 3, GroupName = "9. Risk")]
+        public int BreakTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 1000)]
+        [Display(Name = "Pause Bars After Stop", Order = 4, GroupName = "9. Risk")]
+        public int PauseBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use Session Window", Description = "Only start grids between Start and End Time (chart time) and flatten at End Time.", Order = 5, GroupName = "9. Risk")]
+        public bool UseSession { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2359)]
+        [Display(Name = "Start Time (HHMM)", Order = 6, GroupName = "9. Risk")]
+        public int StartTime { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2359)]
+        [Display(Name = "End Time (HHMM)", Order = 7, GroupName = "9. Risk")]
+        public int EndTime { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trading", Description = "Off = no orders.", Order = 8, GroupName = "9. Risk")]
+        public bool EnableTrading { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Allow Non-Sim Account", Description = "Keep OFF.", Order = 9, GroupName = "9. Risk")]
+        public bool AllowNonSimAccount { get; set; }
+        #endregion
+    }
+}
