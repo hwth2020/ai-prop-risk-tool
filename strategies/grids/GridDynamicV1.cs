@@ -52,10 +52,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double accAvg, realized, cycleBase, dayBase, cyclePeak;
         private DateTime dayDate = DateTime.MinValue;
         private string blockReason = "", lastNote = "idle";
+        private int subsThisBar;
+        private bool visualInit;
         private ATR atr;
 
         private int Warmup { get { return AtrPeriod + 2; } }
         private double Rnd(double v) { return Instrument.MasterInstrument.RoundToTickSize(v); }
+        // Printing / drawing is skipped while NinjaTrader replays history: it makes chart loading very slow.
+        private void Log(string m) { if (State == State.Realtime) Print(LogTag + " " + Time[0] + " " + m); }
 
         protected override void OnStateChange()
         {
@@ -63,7 +67,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Description = "Dynamic grid: ATR-based step that is re-sized while running, trailing profit lock and dynamic stop (unproven).";
                 Name        = "GridDynamicV1";
-                Calculate   = Calculate.OnEachTick;
+                Calculate   = Calculate.OnPriceChange;
                 IsUnmanaged = true;
                 IsOverlay   = true;
                 StartBehavior = StartBehavior.WaitUntilFlat;
@@ -113,9 +117,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (newBar)
             {
                 barsSinceBuild++;
+                subsThisBar = 0;
                 if (paused && --pauseLeft <= 0) paused = false;
             }
 
+            if (State == State.Realtime && !visualInit) { visualInit = true; if (gridOn) DrawGrid(); }
             bool flat = Position.MarketPosition == MarketPosition.Flat;
             if (flat) flattening = false;
             if (flat && s == 0) { cycleBase = realized; cyclePeak = 0; }
@@ -218,7 +224,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!BuildGrid()) { lastNote = "no grid could be built"; return; }
             s = 0; gridOn = true; startedOnce = true; barsSinceBuild = 0;
             lastNote = "grid started: " + N + " buy / " + M + " sell levels";
-            Print(LogTag + " " + Time[0] + " " + lastNote + " | buy " + LevelText(Lb, N) + " | sell " + LevelText(Ls, M));
+            if (State == State.Realtime) Log(lastNote + " | buy " + LevelText(Lb, N) + " | sell " + LevelText(Ls, M));
             DrawGrid();
             PlaceOrders();
         }
@@ -253,7 +259,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             gridOn = false; s = 0;
             if (pauseAfter) { paused = true; pauseLeft = PauseBars; }
             lastNote = "flattened: " + reason;
-            Print(LogTag + " " + Time[0] + " FLATTEN -- " + reason);
+            Log("FLATTEN -- " + reason);
         }
 
         // ---- orders -------------------------------------------------------------------------------------------------
@@ -289,6 +295,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             CancelWorking();
             if (!gridOn || paused) return;
+            if (++subsThisBar > 40) { Flatten("order storm (runaway order loop)", true); return; }
             string oco = "G" + (++ordCounter).ToString(CultureInfo.InvariantCulture) + "_" + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture);
             int q; double px;
             if (DownOrder(out q, out px) && q > 0)
@@ -357,6 +364,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---- drawing --------------------------------------------------------------------------------------------------
         private void DrawGrid()
         {
+            if (State != State.Realtime) return;
             for (int j = 1; j <= 40; j++) { RemoveDrawObject("GRb" + j); RemoveDrawObject("GRs" + j); }
             RemoveDrawObject("GRa");
             for (int j = 1; j <= N; j++) Draw.HorizontalLine(this, "GRb" + j, Lb[j], Brushes.SeaGreen);
@@ -366,6 +374,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void DrawStats(double cyc)
         {
+            if (State != State.Realtime) return;
             string text = Name + "  |  " + (!EnableTrading ? "OFF" : (State == State.Realtime && !tradingAllowed) ? "BLOCKED" : gridOn ? "GRID ON" : paused ? "PAUSED" : "WAITING")
                 + "\nstate " + s + " (" + (s > 0 ? "long " + s + " lvl" : s < 0 ? "short " + (-s) + " lvl" : "flat") + "), position " + accPos
                 + "  |  cycle $" + cyc.ToString("F0") + "  |  realized $" + realized.ToString("F0")

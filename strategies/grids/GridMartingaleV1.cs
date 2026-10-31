@@ -51,6 +51,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string blockReason = "", lastNote = "idle";
 
         private double Rnd(double v) { return Instrument.MasterInstrument.RoundToTickSize(v); }
+        // Printing / drawing is skipped while NinjaTrader replays history: it makes chart loading very slow.
+        private void Log(string m) { if (State == State.Realtime) Print(LogTag + " " + Time[0] + " " + m); }
 
         protected override void OnStateChange()
         {
@@ -58,7 +60,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Description = "Martingale grid: averages into a losing position with doubling size, one take profit at the average; time stop and size caps (unproven).";
                 Name        = "GridMartingaleV1";
-                Calculate   = Calculate.OnEachTick;
+                Calculate   = Calculate.OnPriceChange;
                 IsUnmanaged = true;
                 IsOverlay   = true;
                 StartBehavior = StartBehavior.WaitUntilFlat;
@@ -154,7 +156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             tpOrd = null; lvlOrds.Clear();
             SubmitOrderUnmanaged(0, d > 0 ? OrderAction.Buy : OrderAction.SellShort, OrderType.Market, cycleBaseQty, 0, 0, "", "B1");
             lastNote = "cycle started " + (d > 0 ? "LONG" : "SHORT") + " x" + cycleBaseQty + " (loss streak " + lossStreak + ", win streak " + winStreak + ", loss bank $" + lossBank.ToString("F0") + ")";
-            Print(LogTag + " " + Time[0] + " " + lastNote);
+            Log(lastNote);
         }
 
         private void PlaceLevels()
@@ -211,7 +213,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (Position.MarketPosition == MarketPosition.Short)
                 SubmitOrderUnmanaged(0, OrderAction.BuyToCover, OrderType.Market, Position.Quantity, 0, 0, "", "BX");
             lastNote = "closing cycle: " + reason;
-            Print(LogTag + " " + Time[0] + " CLOSE -- " + reason);
+            Log("CLOSE -- " + reason);
             if (Position.MarketPosition == MarketPosition.Flat && accPos == 0) EndCycle();
         }
 
@@ -227,7 +229,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             inCycle = false; closing = false;
             if (pauseOnEnd) { paused = true; pauseLeft = PauseBars; }
             lastNote = "cycle ended " + (res >= 0 ? "+" : "") + res.ToString("F0") + "$ (levels filled " + (levelsFilled + 1) + ")";
-            Print(LogTag + " " + Time[0] + " " + lastNote);
+            Log(lastNote);
         }
 
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filledQty,
@@ -285,6 +287,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void DrawStats(double cyc)
         {
+            if (State != State.Realtime) return;
             string text = Name + "  |  " + (!EnableTrading ? "OFF" : (State == State.Realtime && !tradingAllowed) ? "BLOCKED" : inCycle ? "IN CYCLE" : paused ? "PAUSED" : "WAITING")
                 + "\n" + (inCycle ? (dirSign > 0 ? "LONG" : "SHORT") + " " + accPos + " @ " + accAvg.ToString("F2") + ", levels filled " + (levelsFilled + 1) + "/" + Levels
                     + ", TP " + curTpTicks.ToString("F0") + " ticks, cycle $" + cyc.ToString("F0") : "flat")
