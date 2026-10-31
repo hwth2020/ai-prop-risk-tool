@@ -25,6 +25,7 @@ moves the grid state by one level. Guards: max loss per cycle, range break (Brea
 limit, optional session window, Sim/Playback-only account guard in real time.
 
 ## Known limits
+- On a chart or in Playback leave "Trade Historical Bars" OFF (orders placed during history cannot be carried over to live); turn it ON only for Strategy Analyzer backtests.
 - Not compiled here: expect to fix small API differences on first compile.
 - Strategy Analyzer on bar data fills at most one level per bar; use tick data / Tick Replay for realistic grids.
 - Partial fills are not handled specially; keep whole-contract quantities. Commission is not in the on-chart P&L.

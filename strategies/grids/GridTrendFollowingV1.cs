@@ -94,6 +94,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrading      = true;
                 AllowNonSimAccount = false;
                 DebugLog           = false;
+                TradeHistory       = false;
             }
             else if (State == State.DataLoaded)
             {
@@ -134,6 +135,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (DebugLog && BarsInProgress == 0 && CurrentBar % 500 == 0) Print(LogTag + " heartbeat: bar " + CurrentBar + " " + Time[0] + " state " + State);
             if (BarsInProgress != 0 || CurrentBar < Math.Max(BarsRequiredToTrade, Warmup)) return;
+            if (State == State.Historical && !TradeHistory) return;      // no historical orders: they cannot be carried over to live cleanly
             DateTime t = Time[0];
             if (t.Date != dayDate) { dayDate = t.Date; dayBase = realized; dayStopped = false; }
             bool newBar = IsFirstTickOfBar;
@@ -499,6 +501,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Debug Log", Description = "Write state changes, a heartbeat every 500 bars and every order to the NinjaScript Output window.", Order = 10, GroupName = "9. Risk")]
         public bool DebugLog { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade Historical Bars", Description = "OFF (recommended on a chart / Playback): no orders while NinjaTrader replays history, so no historical orders have to be carried over to live. ON only for Strategy Analyzer backtests.", Order = 11, GroupName = "9. Risk")]
+        public bool TradeHistory { get; set; }
         #endregion
     }
 }
