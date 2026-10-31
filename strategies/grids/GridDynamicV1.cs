@@ -95,6 +95,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DebugLog           = false;
                 TradeHistory       = false;
             }
+            else if (State == State.Configure)
+            {
+                // Force it: NinjaTrader saves strategy properties with the chart / workspace, so an instance created with an
+                // older build could keep StartBehavior.WaitUntilFlat, which tries to cancel live orders on start and fails in Playback.
+                StartBehavior = StartBehavior.ImmediatelySubmit;
+            }
             else if (State == State.DataLoaded)
             {
                 atr = ATR(AtrPeriod);
@@ -105,7 +111,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     blockReason = "account " + Account.Name + " is not a Sim / Playback account -- live trading blocked";
                     Print(LogTag + " " + blockReason);
                 }
-                Print(LogTag + " " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
+                Print(LogTag + " build 5 | StartBehavior=" + StartBehavior + " | TradeHistory=" + TradeHistory + " | " + Instrument.FullName + " " + BarsPeriod + ": trading " + EnableTrading);
             }
             else if (State == State.Realtime)
             {
