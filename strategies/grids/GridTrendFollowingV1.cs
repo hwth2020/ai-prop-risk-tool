@@ -57,6 +57,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool visualInit;
         private EMA emaF, emaS;
 
+        // The account (not just this strategy) must be flat before a grid / cycle starts. This replaces
+        // StartBehavior.WaitUntilFlat, which made NinjaTrader try to cancel live orders at start and fail in Playback.
+        private bool AccountFlat()
+        {
+            try { return PositionAccount == null || PositionAccount.MarketPosition == MarketPosition.Flat; }
+            catch { return true; }
+        }
+
         private int Warmup { get { return SlowPeriod + 2; } }
         private double Rnd(double v) { return Instrument.MasterInstrument.RoundToTickSize(v); }
         // Printing / drawing is skipped while NinjaTrader replays history: it makes chart loading very slow.
@@ -72,7 +80,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Calculate   = Calculate.OnPriceChange;
                 IsUnmanaged = true;
                 IsOverlay   = true;
-                StartBehavior = StartBehavior.WaitUntilFlat;
+                StartBehavior = StartBehavior.ImmediatelySubmit;
                 BarsRequiredToTrade = 30;
                 FastPeriod = 12; SlowPeriod = 144; TrendExit = true; AllowShort = false;
                 GridStepTicks = 40; Levels = 5; QtyPerLevel = 1; RecenterTicks = 80; ProfitLockDollars = 0;
@@ -142,7 +150,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (gridOn) Guards(cyc);
             if (gridOn && s == 0 && flat && newBar && RebuildDue()) { CancelWorking(); gridOn = false; }
-            if (!gridOn && !paused && flat && s == 0 && !dayStopped && inSession && newBar) TryStart();
+            if (!gridOn && !paused && flat && s == 0 && !dayStopped && inSession && newBar && AccountFlat()) TryStart();
             if (newBar && gridOn) StrategyBar();
             if (newBar) DrawStats(cyc);
         }
