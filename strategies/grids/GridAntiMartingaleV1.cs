@@ -514,14 +514,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             return Math.Max(MlMinStepTicks * TickSize, Math.Round(px / TickSize) * TickSize);
         }
 
-        // how far beyond the outermost level before the grid is cut: widened by the measured fat tails
-        private double BreakDist()
-        {
-            double d = BreakTicks * TickSize;
-            if (!MlOn()) return d;
-            return Math.Max(d, MlBreakSigmas * SigmaH() * Math.Max(1.0, ml.TailZ99 / 2.576));
-        }
-
         // regime filter: do not start a grid into a volatility spike or a fat-tailed regime
         private bool MlAllowsStart()
         {
